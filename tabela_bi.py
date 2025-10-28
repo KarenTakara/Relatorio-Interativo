@@ -181,27 +181,165 @@ class PowerBIInterativo:
             self.redraw()
             return
 
-        resumo = df_plot.groupby('anomes')['valor'].sum().reset_index()
-        self.ax.plot(resumo['anomes'], resumo['valor'], marker='o', color='#4A90E2', linewidth=2)
+        # 🔍 Filtrar PIs recorrentes
+        if 'pi' in df_plot.columns:
+            recorrentes = df_plot['pi'].value_counts()
+            pis_recor = recorrentes[recorrentes >= 2].index.tolist()
+            df_plot = df_plot[df_plot['pi'].isin(pis_recor)]
+        else:
+            pis_recor = []
+            print("Coluna 'pi' não encontrada — exibindo todos os registros.")
 
-        for x, y in zip(resumo['anomes'], resumo['valor']):
-            self.ax.text(x, y, f"R$ {y:,.0f}", ha='center', va='bottom', fontsize=8, rotation=45)
+        if df_plot.empty:
+            self.ax.text(0.5, 0.5, "Nenhuma PI recorrente encontrada", ha='center', va='center', fontsize=14, color='gray')
+            self.redraw()
+            return
 
-        total = resumo['valor'].sum()
-        media = resumo['valor'].mean()
-        pico = resumo['valor'].max()
-        mes_pico = resumo.loc[resumo['valor'].idxmax(), 'anomes']
+        # 🎨 Cores por cliente
+        clientes_unicos = df_plot['cliente'].unique().tolist()
+        cmap = plt.get_cmap('tab20')
+        cores = {cliente: cmap(i % 20) for i, cliente in enumerate(clientes_unicos)}
 
-        self.ax.set_title(f"Total Líquido Mensal - Total: R$ {total:,.2f}", fontsize=14, fontweight='bold')
+        # Guardar info para clique
+        self.scatter_data = []
+        self.text_labels = []
+
+        # 📊 Plotar linhas e bolinhas por cliente
+        for cliente in clientes_unicos:
+            df_cliente = df_plot[df_plot['cliente'] == cliente]
+            resumo = df_cliente.groupby('anomes')['valor'].sum().reset_index()
+
+            linha, = self.ax.plot(
+                resumo['anomes'],
+                resumo['valor'],
+                marker='o',
+                linestyle='-',
+                linewidth=2,
+                color=cores[cliente],
+                alpha=0.8,
+                label=cliente
+            )
+
+            pontos = self.ax.scatter(
+                resumo['anomes'],
+                resumo['valor'],
+                s=100,
+                color=cores[cliente],
+                edgecolor='black',
+                alpha=0.9,
+                picker=True  # 🔹 habilita clique
+            )
+
+            self.scatter_data.append((pontos, linha, cliente, resumo))
+
+        # 🧮 Estatísticas gerais
+        total = df_plot['valor'].sum()
+        media = df_plot['valor'].mean()
+        pico = df_plot['valor'].max()
+        mes_pico = df_plot.loc[df_plot['valor'].idxmax(), 'anomes']
+
+        # 🏷️ Título dinâmico com contagem de PIs
+        self.ax.set_title(
+            f"Desempenho de Clientes com PIs Recorrentes (Total de {len(pis_recor)} PIs)",
+            fontsize=14,
+            fontweight='bold',
+            pad=25
+        )
+
+        # Limpar texto de cliente ativo
+        if hasattr(self, "cliente_texto") and self.cliente_texto is not None:
+            try:
+                self.cliente_texto.remove()
+            except Exception:
+                pass
+        self.cliente_texto = None
+
         self.ax.set_xlabel("Mês")
         self.ax.set_ylabel("Valor (R$)")
         self.ax.grid(True, linestyle='--', alpha=0.3)
         plt.xticks(rotation=45)
         self.ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"R$ {x:,.0f}"))
 
-        self.stats_label.config(text=f"Total: R$ {total:,.0f} | Média: R$ {media:,.0f} | Pico: R$ {pico:,.0f} ({mes_pico})")
+        legend = self.ax.legend(
+            title="Cliente",
+            bbox_to_anchor=(1.02, 1),
+            loc='upper left',
+            borderaxespad=0,
+            fontsize=9
+        )
+        legend.get_title().set_fontsize('10')
+        self.fig.subplots_adjust(right=0.78)
 
+        self.stats_label.config(
+            text=f"Total: R$ {total:,.0f} | Média: R$ {media:,.0f} | Pico: R$ {pico:,.0f} ({mes_pico})"
+        )
+
+        self.fig.canvas.mpl_connect('pick_event', self.on_point_click)
         self.redraw()
+
+
+    # ==========================================================
+    # 🔵 Clique nas bolinhas: destacar e mostrar valores
+    # ==========================================================
+    def on_point_click(self, event):
+        artist = event.artist
+
+        # Remover textos antigos (valores e nome de cliente)
+        for txt in getattr(self, "text_labels", []):
+            txt.remove()
+        self.text_labels = []
+
+        if hasattr(self, "cliente_texto") and self.cliente_texto:
+            self.cliente_texto.remove()
+            self.cliente_texto = None
+
+        for pontos, linha, cliente, resumo in self.scatter_data:
+            if artist == pontos:
+                # Apagar destaques anteriores
+                for p, l, _, _ in self.scatter_data:
+                    l.set_linewidth(2)
+                    l.set_alpha(0.3)
+                    p.set_sizes([100])
+                    p.set_alpha(0.3)
+
+                # Destacar o cliente clicado
+                linha.set_linewidth(3.5)
+                linha.set_alpha(1)
+                pontos.set_sizes([200])
+                pontos.set_alpha(1)
+
+                # 💰 Mostrar os valores em cada ponto
+                for x, y in zip(resumo['anomes'], resumo['valor']):
+                    self.text_labels.append(
+                        self.ax.text(
+                            x, y,
+                            f"R$ {y:,.0f}",
+                            ha='center',
+                            va='bottom',
+                            fontsize=8,
+                            color='black',
+                            fontweight='bold',
+                            rotation=45
+                        )
+                    )
+
+                # 🧾 Mostrar nome do cliente abaixo do título
+                self.cliente_texto = self.ax.text(
+                    0.5, 1.01,
+                    f"🔹 Cliente: {cliente}",
+                    transform=self.ax.transAxes,
+                    ha='center',
+                    va='bottom',
+                    fontsize=10,
+                    fontweight='bold',
+                    color='navy'
+                )
+
+                self.redraw()
+                break
+
+
+
 
     def redraw(self):
         if hasattr(self, 'canvas'):
