@@ -18,6 +18,9 @@ class PowerBIInterativo:
         self.root.title("Power BI em Python - Relatório Interativo")
         self.root.geometry("1500x900")
         self.source_file = source_file
+        self.cnpj_filtered = False
+        self.last_cnpj_search = ""
+        self.clientes_tree = None
         
         self.setup_styles()
         try:
@@ -30,6 +33,16 @@ class PowerBIInterativo:
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao carregar dados: {str(e)}")
             root.destroy()
+
+    @staticmethod
+    def _only_digits(value):
+        return ''.join(ch for ch in str(value) if ch.isdigit())
+
+    @staticmethod
+    def _format_cnpj(digits):
+        if len(digits) == 14 and digits.isdigit():
+            return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+        return digits
 
     def process_csv_data(self, file_path):
         """Ler e preparar dados do CSV (normalização robusta de nomes de coluna)"""
@@ -47,10 +60,11 @@ class PowerBIInterativo:
             return s
 
         print(f"Carregando dados de: {file_path}")
+        read_kwargs = dict(sep=';', engine='python', dtype=str)
         try:
-            df = pd.read_csv(file_path, encoding='utf-8', sep=';', engine='python')
+            df = pd.read_csv(file_path, encoding='utf-8', **read_kwargs)
         except Exception:
-            df = pd.read_csv(file_path, encoding='latin1', sep=';', engine='python')
+            df = pd.read_csv(file_path, encoding='latin1', **read_kwargs)
 
         print("Colunas originais:", list(df.columns))
 
@@ -64,6 +78,10 @@ class PowerBIInterativo:
         total_col = next((c for c in df.columns if ('total' in c and ('liquido' in c or 'liquid' in c or 'valor' in c or 'total' == c))), None)
         cliente_col = next((c for c in df.columns if ('cliente' in c and 'veiculo' not in c)), None)
         campanha_col = next((c for c in df.columns if 'campanha' in c), None)
+        estado_cliente_col = next((c for c in df.columns if ('estado' in c and 'cliente' in c)), None)
+        cnpj_col = next((c for c in df.columns if ('cnpj' in c and 'cliente' in c)), None)
+        if not cnpj_col:
+            cnpj_col = next((c for c in df.columns if 'cnpj' in c), None)
 
         print("Detectado -> data_col:", data_col, " total_col:", total_col, " cliente_col:", cliente_col, " campanha_col:", campanha_col)
 
@@ -100,15 +118,66 @@ class PowerBIInterativo:
         df['cliente'] = df['cliente'].fillna('Desconhecido')
         df['campanha'] = df['campanha'].fillna('Sem Campanha')
 
+        if estado_cliente_col and estado_cliente_col in df.columns:
+            df['estado_cliente'] = df[estado_cliente_col]
+        else:
+            df['estado_cliente'] = ''
+        df['estado_cliente'] = df['estado_cliente'].fillna('').astype(str).str.strip().str.upper()
+
+        if cnpj_col and cnpj_col in df.columns:
+            df['cnpj'] = df[cnpj_col].astype(str).fillna('')
+        else:
+            df['cnpj'] = ''
+        df['cnpj_digits'] = df['cnpj'].apply(self._only_digits)
+        self.has_cnpj_data = cnpj_col is not None
+
         self.df = df
+        self.build_cliente_labels()
         self.available_years = sorted(df['ano'].unique().tolist())
-        self.available_clientes = sorted(df['cliente'].dropna().unique().tolist())
+        self.available_clientes = sorted(self.df['cliente_label'].dropna().unique().tolist())
         self.available_campanhas = sorted(df['campanha'].dropna().unique().tolist())
 
         print(f"Arquivo carregado com {len(df)} linhas.")
         print(f"Anos disponíveis: {self.available_years}")
         print(f"Clientes únicos: {len(self.available_clientes)}")
         print(f"Campanhas únicas: {len(self.available_campanhas)}")
+
+    def build_cliente_labels(self):
+        df_sorted = self.df.sort_values('data')
+        label_map = {}
+
+        for _, row in df_sorted.iterrows():
+            digits = row.get('cnpj_digits', '')
+            if not digits:
+                continue
+            if digits not in label_map:
+                label_map[digits] = {
+                    'cliente': row.get('cliente', 'Desconhecido'),
+                    'estado': row.get('estado_cliente', '')
+                }
+
+        self.cnpj_label_map = label_map
+
+        def label_row(row):
+            digits = row.get('cnpj_digits', '')
+            estado = row.get('estado_cliente', '')
+            if digits and digits in label_map:
+                info = label_map[digits]
+                nome = info.get('cliente') or row.get('cliente', 'Desconhecido')
+                uf = info.get('estado') or estado
+            else:
+                nome = row.get('cliente', 'Desconhecido')
+                uf = estado
+
+            uf_text = f" - {uf}" if uf else ""
+            return f"{nome}{uf_text}"
+
+        self.df['cliente_label'] = self.df.apply(label_row, axis=1)
+        self.cliente_label_order = [
+            (digits, info.get('cliente', 'Desconhecido'), info.get('estado', ''))
+            for digits, info in label_map.items()
+        ]
+        self.cliente_label_order.sort(key=lambda x: (x[1] or '').lower())
 
     def setup_styles(self):
         style = ttk.Style()
@@ -130,12 +199,18 @@ class PowerBIInterativo:
         self.ano_combo.pack(side=tk.LEFT, padx=(0, 20))
         self.ano_combo.bind('<<ComboboxSelected>>', lambda e: self.update_plot())
 
-        ttk.Label(control_frame, text="Cliente:", style='Header.TLabel').pack(side=tk.LEFT, padx=(0, 5))
-        self.cliente_var = tk.StringVar(value='Todos')
-        self.cliente_combo = ttk.Combobox(control_frame, textvariable=self.cliente_var, width=40, state="readonly")
-        self.cliente_combo['values'] = ['Todos'] + self.available_clientes
-        self.cliente_combo.pack(side=tk.LEFT, padx=(0, 20))
-        self.cliente_combo.bind('<<ComboboxSelected>>', lambda e: self.update_plot())
+        ttk.Label(control_frame, text="CNPJ:", style='Header.TLabel').pack(side=tk.LEFT, padx=(0, 5))
+        self.cnpj_var = tk.StringVar()
+        self.cnpj_entry = ttk.Entry(control_frame, textvariable=self.cnpj_var, width=28)
+        entry_state = 'normal' if getattr(self, 'has_cnpj_data', False) else 'disabled'
+        self.cnpj_entry.config(state=entry_state)
+        self.cnpj_entry.pack(side=tk.LEFT, padx=(0, 20))
+
+        if entry_state == 'disabled':
+            self.cnpj_var.set("CNPJ não disponível")
+        else:
+            self.cnpj_entry.bind('<Return>', lambda e: self.update_plot())
+            self.cnpj_entry.bind('<FocusOut>', lambda e: self.update_plot())
 
         ttk.Label(control_frame, text="Campanha:", style='Header.TLabel').pack(side=tk.LEFT, padx=(0, 5))
         self.campanha_var = tk.StringVar(value='Todas')
@@ -149,9 +224,64 @@ class PowerBIInterativo:
         self.stats_label = ttk.Label(control_frame, text="", style='Header.TLabel')
         self.stats_label.pack(side=tk.LEFT, padx=(20, 0))
 
-        self.plot_frame = ttk.Frame(main_frame)
-        self.plot_frame.pack(fill=tk.BOTH, expand=True)
+        content_frame = ttk.Frame(main_frame)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.clientes_frame = ttk.LabelFrame(content_frame, text="Clientes (agrupados por CNPJ)")
+        self.clientes_frame.config(width=360, height=600)
+        self.clientes_frame.pack(side=tk.LEFT, padx=(0, 10))
+        self.clientes_frame.pack_propagate(False)
+        self.setup_client_table()
+
+        self.plot_frame = ttk.Frame(content_frame)
+        self.plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.create_plot()
+
+    def setup_client_table(self):
+        if not hasattr(self, 'clientes_frame'):
+            return
+
+        columns = ('cliente', 'estado', 'cnpj')
+        self.clientes_tree = ttk.Treeview(
+            self.clientes_frame,
+            columns=columns,
+            show='headings',
+            height=20
+        )
+        self.clientes_tree.heading('cliente', text='Cliente')
+        self.clientes_tree.heading('estado', text='UF')
+        self.clientes_tree.heading('cnpj', text='CNPJ')
+        self.clientes_tree.column('cliente', width=220, anchor='w')
+        self.clientes_tree.column('estado', width=40, anchor='center')
+        self.clientes_tree.column('cnpj', width=150, anchor='center')
+
+        y_scroll = ttk.Scrollbar(self.clientes_frame, orient=tk.VERTICAL, command=self.clientes_tree.yview)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        x_scroll = ttk.Scrollbar(self.clientes_frame, orient=tk.HORIZONTAL, command=self.clientes_tree.xview)
+        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.clientes_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.clientes_tree.pack(fill=tk.BOTH, expand=True)
+        self.populate_client_table()
+
+    def populate_client_table(self):
+        if not self.clientes_tree:
+            return
+        for item in self.clientes_tree.get_children():
+            self.clientes_tree.delete(item)
+
+        source = getattr(self, 'cliente_label_order', [])
+        if not source:
+            source = [
+                (row.get('cnpj_digits', ''), row.get('cliente', 'Desconhecido'), row.get('estado_cliente', ''))
+                for _, row in self.df.iterrows()
+            ]
+
+        for digits, cliente, estado in source:
+            cliente = cliente or 'Desconhecido'
+            estado = (estado or '').upper()
+            cnpj_formatado = self._format_cnpj(digits)
+            self.clientes_tree.insert('', tk.END, values=(cliente, estado, cnpj_formatado))
 
     def create_plot(self):
         self.fig, self.ax = plt.subplots(figsize=(14, 8))
@@ -160,14 +290,31 @@ class PowerBIInterativo:
     def filtrar_dados(self):
         df = self.df.copy()
         ano = self.ano_var.get()
-        cliente = self.cliente_var.get()
+        cnpj_input = self.cnpj_var.get().strip() if hasattr(self, 'cnpj_var') else ''
         campanha = self.campanha_var.get()
+        self.cnpj_filtered = False
+        self.last_cnpj_search = ""
+        aplicar_ano = True
+        aplicar_campanha = True
 
-        if ano != 'Todos':
+        if cnpj_input and getattr(self, 'has_cnpj_data', False):
+            normalized = self._only_digits(cnpj_input)
+            if normalized:
+                df = df[df['cnpj_digits'].str.contains(normalized, na=False)]
+            else:
+                df = df[df['cnpj'].str.contains(cnpj_input, case=False, na=False)]
+            self.cnpj_filtered = True
+            self.last_cnpj_search = normalized or cnpj_input
+            aplicar_ano = False
+            aplicar_campanha = False
+            if self.ano_var.get() != 'Todos':
+                self.ano_var.set('Todos')
+            if self.campanha_var.get() != 'Todas':
+                self.campanha_var.set('Todas')
+
+        if aplicar_ano and ano != 'Todos':
             df = df[df['ano'] == int(ano)]
-        if cliente != 'Todos':
-            df = df[df['cliente'] == cliente]
-        if campanha != 'Todas':
+        if aplicar_campanha and campanha != 'Todas':
             df = df[df['campanha'] == campanha]
 
         return df
@@ -181,22 +328,19 @@ class PowerBIInterativo:
             self.redraw()
             return
 
-        # 🔍 Filtrar PIs recorrentes
+        # 📌 Estatística opcional de PIs recorrentes (não filtra mais os dados)
+        cnpj_filtered = getattr(self, 'cnpj_filtered', False)
         if 'pi' in df_plot.columns:
             recorrentes = df_plot['pi'].value_counts()
             pis_recor = recorrentes[recorrentes >= 2].index.tolist()
-            df_plot = df_plot[df_plot['pi'].isin(pis_recor)]
         else:
             pis_recor = []
             print("Coluna 'pi' não encontrada — exibindo todos os registros.")
 
-        if df_plot.empty:
-            self.ax.text(0.5, 0.5, "Nenhuma PI recorrente encontrada", ha='center', va='center', fontsize=14, color='gray')
-            self.redraw()
-            return
-
-        # 🎨 Cores por cliente
-        clientes_unicos = df_plot['cliente'].unique().tolist()
+        # 🎨 Cores por cliente/CNPJ agrupado
+        if 'cliente_label' not in df_plot.columns:
+            df_plot['cliente_label'] = df_plot['cliente']
+        clientes_unicos = df_plot['cliente_label'].unique().tolist()
         cmap = plt.get_cmap('tab20')
         cores = {cliente: cmap(i % 20) for i, cliente in enumerate(clientes_unicos)}
 
@@ -206,7 +350,7 @@ class PowerBIInterativo:
 
         # 📊 Plotar linhas e bolinhas por cliente
         for cliente in clientes_unicos:
-            df_cliente = df_plot[df_plot['cliente'] == cliente]
+            df_cliente = df_plot[df_plot['cliente_label'] == cliente]
             resumo = df_cliente.groupby('anomes')['valor'].sum().reset_index()
 
             linha, = self.ax.plot(
@@ -238,13 +382,13 @@ class PowerBIInterativo:
         pico = df_plot['valor'].max()
         mes_pico = df_plot.loc[df_plot['valor'].idxmax(), 'anomes']
 
-        # 🏷️ Título dinâmico com contagem de PIs
-        self.ax.set_title(
-            f"Desempenho de Clientes com PIs Recorrentes (Total de {len(pis_recor)} PIs)",
-            fontsize=14,
-            fontweight='bold',
-            pad=25
-        )
+        # 🏷️ Título dinâmico
+        if cnpj_filtered:
+            cnpj_info = getattr(self, 'last_cnpj_search', '')
+            titulo = f"Campanhas vinculadas ao CNPJ {cnpj_info or '(informado)'}"
+        else:
+            titulo = f"Desempenho de Clientes com PIs Recorrentes (Total de {len(pis_recor)} PIs)"
+        self.ax.set_title(titulo, fontsize=14, fontweight='bold', pad=25)
 
         # Limpar texto de cliente ativo
         if hasattr(self, "cliente_texto") and self.cliente_texto is not None:
